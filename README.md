@@ -9,7 +9,10 @@ CVPR 2022 (Oral)
 [Paper](https://arxiv.org/pdf/2204.10916.pdf) | [Website](https://occlusions.cs.columbia.edu/)
 
 <p align="center">
-  <img width="600" src="Teaser.png">
+  <img width="100%" src="Teaser.png">
+</p>
+<p align="center">
+  <img width="100%" src="KeyIdea.png">
 </p>
 
 ## Datasets
