@@ -1,6 +1,6 @@
 '''
 Evaluation logic.
-Created by Basile Van Hoorick for Revealing Occlusions with 4D Neural Fields.
+Created by Basile Van Hoorick and Purva Tendulkar for Revealing Occlusions with 4D Neural Fields.
 '''
 
 from __init__ import *
