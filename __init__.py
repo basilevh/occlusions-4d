@@ -1,6 +1,6 @@
 '''
 These imports are shared across all files.
-Created by Basile Van Hoorick.
+Created by Basile Van Hoorick for Revealing Occlusions with 4D Neural Fields.
 '''
 
 # Library imports.
@@ -9,6 +9,7 @@ import collections
 import collections.abc
 import copy
 import cv2
+import glob
 import imageio
 import json
 import logging
