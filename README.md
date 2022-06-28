@@ -8,6 +8,10 @@ CVPR 2022 (Oral)
 
 [Paper](https://arxiv.org/pdf/2204.10916.pdf) | [Website](https://occlusions.cs.columbia.edu/)
 
+<p align="center">
+  <img width="600" src="Teaser.png">
+</p>
+
 ## Datasets
 
 We contribute GREATER and CARLA, which are described and visualized on our [website](https://occlusions.cs.columbia.edu/).
