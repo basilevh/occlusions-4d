@@ -1,0 +1,687 @@
+'''
+Data loading and processing logic.
+Created by Basile Van Hoorick for Revealing Occlusions with 4D Neural Fields.
+'''
+
+from __init__ import *
+import torch
+
+# Library imports.
+import glob
+import imageio
+import json
+from threading import RLock
+
+# Internal imports.
+import data_utils
+import geometry
+import utils
+
+_MAX_DEPTH_CLIP = 1000.0
+
+_MAX_VALO_IDS = 256
+
+
+def get_occlusion_rate(scene_dp, frame_step, cube_mode):
+    tor_fp = os.path.join(scene_dp, f'occlusion_rate_fs{frame_step}_cm{cube_mode}.npy')
+    occlusion_rate = np.load(tor_fp)  # (K, V, T, 3).
+
+    # Sum across pedestrian / vehicle / dynamic.
+    occlusion_rate = occlusion_rate.sum(axis=0)
+
+    # Select forward view, inframe.
+    occlusion_rate = occlusion_rate[0, :, 2]
+
+    # Apply smoothing.
+    occlusion_rate[1:-1] = occlusion_rate[1:-1] / 2.0 + \
+        occlusion_rate[:-2] / 4.0 + occlusion_rate[2:] / 4.0
+
+    # Calculate cumulative variant which aggregates the last 0.6 seconds.
+    window = 6
+    cum_occl_rate = np.cumsum(occlusion_rate)
+    cum_occl_rate[window:] = cum_occl_rate[window:] - cum_occl_rate[:-window]
+    cum_occl_rate /= window
+
+    return (occlusion_rate, cum_occl_rate)
+
+
+def is_moving_anytime(sensor_RT, frame_start, frame_end, dist_threshold=1.0):
+    '''
+    :param sensor_RT (T, V, 4, 4) numpy array.
+    :return (bool): Whether the car is moving at all within the specified time range.
+    '''
+    # NOTE: We consider the forward view only, since that represents the car.
+    delta = sensor_RT[frame_end - 1, 0] - sensor_RT[frame_start, 0]  # (4, 4).
+    delta = np.abs(delta[..., -1]).sum()
+    return delta >= dist_threshold
+
+
+class CARLADataset(torch.utils.data.Dataset):
+    '''
+    Multiview CARLA dataset for object permanence.
+    Assumes directory & file structure:
+    dataset_root\train\train_01234\mv_raw_all\01234_forward_rgb.png + 01234_forward_lidar.npy + ...
+    '''
+
+    @staticmethod
+    def max_depth_clip():
+        return _MAX_DEPTH_CLIP
+
+    def __init__(self, dataset_root, logger, stage='train',
+                 ss_frame_step=3, video_length=4, frame_skip=4,
+                 n_points_rnd=8192, n_fps_input=1024, n_fps_target=1024,
+                 pcl_input_frames=3, pcl_target_frames=1, reference_frame=None,
+                 correct_origin_ground=True, sample_bias='none', sb_occl_frame_shift=2,
+                 min_z=-1.0, other_bounds=20.0, target_bounds=16.0, cube_mode=4,
+                 oversample_vehped_target=False, use_data_frac=1.0,
+                 use_json=True, verbose=False, live_occl_mode='normal'):
+        '''
+        :param dataset_root (str): Path to dataset or single scene.
+        :param stage (str): Subfolder (dataset split) to use; may remain empty.
+        :param ss_frame_step (int): If a loop over an entire single example video is desired,
+            select video frame skip interval here.
+        :param n_points_rnd (int): Number of points to retain after initial random subsampling.
+            This is applied almost directly after converting the RGB-D data to a point cloud.
+        :param n_fps_input, n_fps_target (int): If > 0, number of points to retain after farthest
+            point sampling of the input and target point clouds respectively after processing for
+            time and/or view aggregation.
+        :param pcl_input_frames (int): Number of input frames to show, counting from the beginning.
+        :param pcl_target_frames (int): Number of target frames to provide, counting from the end.
+            Typically, video_length <= pcl_input_frames + pcl_target_frames.
+        :param reference_frame (int): If not None, time index to use as common coordinate system for
+            all point clouds. This is typically last input frame (i.e. present).
+        :param correct_origin_ground (bool): Translate all lidar measurements in the Z direction
+            such that the origin equals the ground, instead of existing relative to the car height.
+        :param sample_bias (str): Mode for sampling clips within scene videos (none / occl / move).
+        :param sb_occl_frame_shift (int): If sample_bias is occl, then the peak occlusion rate
+            occurs at precisely this many frames before the present (i.e. end of input).
+        :param other_bounds (= pt_cube_bounds) (float): Input cube bounds.
+        :param target_bounds (= cr_cube_bouds) (float): Output & target cube bounds.
+        :param cube_mode (int): Which cuboid shape to use for CARLA (1 / 2 / 3 / 4).
+        :param oversample_vehped_target (bool): Target does not further subsample cars and people.
+        '''
+        self.dataset_root = dataset_root
+        self.logger = logger
+        self.stage = stage
+        self.ss_frame_step = ss_frame_step
+        self.video_length = video_length
+        self.frame_skip = frame_skip
+        self.n_points_rnd = n_points_rnd
+        self.n_fps_input = n_fps_input
+        self.n_fps_target = n_fps_target
+        self.pcl_input_frames = pcl_input_frames
+        self.pcl_target_frames = pcl_target_frames
+        self.reference_frame = reference_frame
+        self.correct_origin_ground = correct_origin_ground
+        self.sample_bias = sample_bias
+        self.sb_occl_frame_shift = sb_occl_frame_shift
+        self.min_z = min_z
+        self.other_bounds = other_bounds
+        self.target_bounds = target_bounds
+        self.cube_mode = cube_mode
+        self.oversample_vehped_target = oversample_vehped_target
+        self.use_data_frac = use_data_frac
+        self.use_json = use_json
+        self.verbose = verbose
+        self.allow_random_frames = True
+        self.live_occl_mode = live_occl_mode
+
+        self.stage_dir = os.path.join(dataset_root, stage)
+        if not os.path.exists(self.stage_dir):
+            self.stage_dir = dataset_root  # We may already be pointing to the stage directory.
+            self.dataset_root = str(pathlib.Path(dataset_root).parent)
+
+        self.is_single_scene = ('mv_raw_all' in os.listdir(self.stage_dir))
+
+        if self.is_single_scene:
+            logger.warning(f'({stage}) Pointing to single example! Ignoring parameters: '
+                           f'sample_bias, sb_occl_frame_shift, use_json.')
+            self.num_scenes = 1
+            self.all_scenes = [self.stage_dir]
+
+            scene_content_dp = os.path.join(self.stage_dir, 'mv_raw_all')
+            image_fns = [fn for fn in os.listdir(scene_content_dp) if 'forward_rgb' in fn]
+            num_total_frames = len(image_fns)
+
+            # Incorporate absolute dataset size if specified.
+            # NOTE: use_data_frac has a different meaning here, compared to the usual case.
+            if use_data_frac < 0.0:
+                self.use_data_frac = 1.0
+                self.multiplier = use_data_frac
+            else:
+                self.use_data_frac = use_data_frac
+                self.multiplier = num_total_frames // self.ss_frame_step - \
+                    self.video_length * self.frame_skip
+
+            self.dset_size = int(self.multiplier * self.use_data_frac)
+
+        else:
+            all_scenes = os.listdir(self.stage_dir)
+            all_scenes = [dn for dn in all_scenes if '_' in dn
+                          and os.path.isdir(os.path.join(self.stage_dir, dn))]
+            all_scenes.sort()
+            self.all_scenes = all_scenes
+            self.num_scenes = len(all_scenes)
+
+            # Incorporate absolute dataset size if specified.
+            if use_data_frac < 0.0:
+                self.num_scenes = int(-use_data_frac)
+                self.all_scenes = self.all_scenes[:self.num_scenes]
+                logger.warning(f'({stage}) Using absolute dataset size: {self.num_scenes}')
+                logger.info(f'({stage}) Dataset examples: {self.all_scenes}')
+                logger.warning(f'({stage}) No random frame starts (always pick middle)!')
+                self.use_data_frac = 1.0
+                self.allow_random_frames = False
+
+            # Ensure non-trivial epoch size even with tiny datasets.
+            # This is justified because we select a small clip within every relatively large video.
+            target_size = 960 if 'train' in stage else 120
+            self.multiplier = max(int(np.ceil(target_size / self.num_scenes)), 1)
+            self.dset_size = int(self.num_scenes * self.multiplier * self.use_data_frac)
+            if self.multiplier > 1:
+                logger.warning(f'({stage}) Using dataset size multiplier: {self.multiplier}')
+
+            if self.sample_bias != 'none':
+                logger.warning(f'({stage}) Sample bias is {self.sample_bias}, '
+                               f'so some options will be ignored.')
+                # Number of returned clips per scene + lock for synchrony.
+                self.max_frames_ever = 10101
+                self.scene_counter = multiprocessing.Array(
+                    'i', self.num_scenes * self.max_frames_ever)
+                self.counter_lock = RLock()
+
+            # Load indices of starting frames (if pre-computed).
+            self.starting_frames = None
+            if 'test' in self.stage and self.use_json:
+                move_str = '_move' if 'move' in sample_bias else ''
+
+                # Even if we are testing the model, we could still be using the val dset.
+                dset_split = 'val' if 'val' in self.stage_dir else 'test'
+
+                if 1:
+                    # Ensure different ablations have exact same last frame as regular by hardcoding
+                    # reference to 12. Also remember manual shift to apply.
+                    test_frames_fn = f'{dset_split}_start_frames_shift{sb_occl_frame_shift}_inputframes12_skip{frame_skip}{move_str}.json'
+                    self.json_shift = (12 - pcl_input_frames) * frame_skip
+
+                else:
+                    test_frames_fn = f'{dset_split}_start_frames_shift{sb_occl_frame_shift}_inputframes{pcl_input_frames}_skip{frame_skip}{move_str}.json'
+                    self.json_shift = 0
+
+                test_frames_fp = os.path.join(self.dataset_root, test_frames_fn)
+                if os.path.exists(test_frames_fp):
+                    logger.warning(
+                        f'({stage}) Using {test_frames_fn}, so some options will be ignored.')
+                    logger.warning(
+                        f'({stage}) Manual additional backward frame shift: {self.json_shift}')
+                    with open(test_frames_fp, 'r') as f:
+                        self.starting_frames = json.load(f)
+
+                else:
+                    logger.warning(f'({stage}) {test_frames_fp} not found.')
+
+        self.min_input_size = 64
+        self.min_target_size = 512
+
+        self.to_tensor = torchvision.transforms.ToTensor()
+
+    def __len__(self):
+        return self.dset_size
+
+    def _get_frame_start(self, index, scene_dp, sensor_RT):
+        '''
+        :return (frame_start, num_frames, occl_frame_idx, found_occl_rate, proceed_sample_bias).
+        '''
+
+        scene_content_dp = os.path.join(scene_dp, 'mv_raw_all')
+        image_fns = [fn for fn in os.listdir(scene_content_dp) if 'forward_rgb' in fn]
+        num_frames = len(image_fns)
+        occl_frame_idx = -1
+        found_occl_rate = -1.0
+        proceed_sample_bias = False
+
+        if self.is_single_scene:
+            # index now refers to frame start instead of scene index.
+            scene_idx = -1
+            frame_start = index * self.ss_frame_step
+
+        else:
+            scene_idx = index % self.num_scenes  # Avoid same index for subsequent examples.
+            frame_low = 10
+            frame_high = num_frames - 20
+            frame_start_high = frame_high - self.video_length * self.frame_skip
+
+            # Make initial random clip selection, to be refined later.
+            frame_start = np.random.randint(frame_low, frame_start_high)
+
+            proceed_sample_bias = True
+            if self.starting_frames is not None:
+                # Always use preselected frame_start.
+                frame_start = self.starting_frames[str(scene_idx)]
+                frame_start += self.json_shift
+                proceed_sample_bias = False
+            elif 'test' not in self.stage:
+                # During train & val, only perform biased clip sampling 40% of the time.
+                proceed_sample_bias = (np.random.rand() < 0.40)
+
+            elif self.sample_bias != 'none' and proceed_sample_bias:
+
+                if 'occl' in self.sample_bias:
+                    # Assume that the occlusion "happens at" the index where cum_occl_rate is
+                    # the largest, even though it represents more of a moving average (due to
+                    # the very high noisiness of the signal) and thus a time range. First, look
+                    # for the frame indices with maximal occlusion rates, and then take care to
+                    # assign the clip bounds correctly.
+                    (occlusion_rate, cum_occl_rate) = get_occlusion_rate(
+                        scene_dp, 3, self.cube_mode)
+                    select_top = 120
+                    top_frame_inds = np.argpartition(cum_occl_rate, -select_top)[-select_top:]
+                    top_frame_inds = top_frame_inds[np.argsort(cum_occl_rate[top_frame_inds])]
+                    top_frame_inds = top_frame_inds[::-1]  # Rank highest to lowest.
+
+                    # During train & val, only follow the ranking very roughly and with extra
+                    # randomness. https://github.com/rragundez/elitist-shuffle
+                    if 'test' not in self.stage:
+                        top_frame_inds = utils.elitist_shuffle(top_frame_inds, inequality=4)
+
+                    # The occlusion must happen near the end of the input.
+                    time_shift = int((self.pcl_input_frames - self.sb_occl_frame_shift) *
+                                     self.frame_skip)
+                    found_occl_rate = -1.0
+                    range_blocks = 0
+                    move_blocks = 0
+                    counter_blocks = 0
+
+                    for occl_frame_idx in top_frame_inds:
+                        try_frame_start = occl_frame_idx - time_shift
+                        try_frame_end = try_frame_start + \
+                            self.video_length * self.frame_skip
+
+                        if try_frame_start < frame_low or frame_start_high <= try_frame_start:
+                            range_blocks += 1
+                            continue
+
+                        if 'move' in self.sample_bias and not is_moving_anytime(
+                                sensor_RT, try_frame_start, try_frame_end):
+                            if 'test' in self.stage or np.random.rand() < 0.97:
+                                move_blocks += 1
+                                continue
+
+                        with self.counter_lock:
+                            # During train & val, allow occasional double counting because we
+                            # have so many epochs.
+                            counter_idx = scene_idx * self.max_frames_ever + frame_start
+                            if 'test' in self.stage or np.random.rand() < 0.9:
+                                if self.scene_counter[counter_idx] > 0:
+                                    counter_blocks += 1
+                                    continue
+
+                            # Commit to this clip so that it cannot be reselected. Next time
+                            # this scene index comes up, it will map to a lower occlusion rate.
+                            self.scene_counter[counter_idx] += 1
+                            frame_start = try_frame_start
+                            found_occl_rate = cum_occl_rate[occl_frame_idx]
+                            break
+
+                    if found_occl_rate < 0.0:
+                        self.logger.warning(f'No clip with high occlusion rate found! '
+                                            f'Time range blocks: {range_blocks}. '
+                                            f'Non-moving blocks: {move_blocks}. '
+                                            f'Counter blocks: {counter_blocks}. '
+                                            f'Keeping random frame_start: {frame_start}...')
+
+                elif 'move' in self.sample_bias:
+                    # The only restriction is that the car has to be in motion. We can simply
+                    # cycle the outer loop to find this case.
+                    try_frame_end = frame_start + \
+                        self.video_length * self.frame_skip
+                    if not is_moving_anytime(sensor_RT, frame_start, try_frame_end):
+                        frame_start = None  # Implies continue when returning.
+
+            elif not self.allow_random_frames:
+                frame_start = num_frames // 2
+
+        return (frame_start, num_frames, occl_frame_idx, found_occl_rate, proceed_sample_bias)
+
+    def __getitem__(self, index):
+        '''
+        :return Dictionary with all information for a single example.
+        '''
+        initial_index = index
+        keep_nss = ('unfilt' in self.live_occl_mode)
+
+        # NOTE: Ideally, all scenes should be valid. However, in rare cases, not every merged target
+        # contains a sufficient number of points. Hence, we have to keep retrying until we find a
+        # valid example to train / test on.
+        attempts = 0
+        is_valid = False
+
+        while not is_valid:
+            attempts += 1
+            if attempts >= 2:
+                if self.is_single_scene:
+                    raise RuntimeError('The single specified scene must work for every index.')
+                raise RuntimeError('This should not happen anymore in general.')
+                index = np.random.randint(self.num_scenes)
+
+            try:
+
+                if self.is_single_scene:
+                    # index now refers to frame start instead of scene index.
+                    scene_idx = -1
+                    scene_dp = self.all_scenes[0]
+                    scene_dn = str(pathlib.Path(scene_dp).name)
+
+                else:
+                    scene_idx = index % self.num_scenes  # Avoid same index for subsequent examples.
+                    scene_dn = self.all_scenes[scene_idx]
+                    scene_dp = os.path.join(self.stage_dir, scene_dn)
+
+                video_fp = os.path.join(scene_dp, scene_dn + '_video_multiview.mp4')
+                if not os.path.exists(video_fp):
+                    continue
+                scene_content_dp = os.path.join(scene_dp, 'mv_raw_all')
+                sensor_matrices_fp = os.path.join(scene_content_dp, 'sensor_matrices.npy')
+                if not os.path.exists(sensor_matrices_fp):
+                    continue
+
+                sensor_RT = np.load(os.path.join(scene_content_dp, 'sensor_matrices.npy'))
+                sensor_RT = sensor_RT.astype(np.float32)  # (T, V, 4, 4) = (2010, 8, 4, 4).
+                sensor_K = np.load(os.path.join(scene_content_dp, 'camera_K.npy'))
+                sensor_K = sensor_K.astype(np.float32)  # (3, 3).
+                # sensor_names = list(np.genfromtxt(
+                #     os.path.join(scene_content_dp, 'sensor_names.txt'), dtype='str'))
+                # carla_mv_3 sensor_names:
+                # ['forward_rgb', 'forward_lidar', 'forward_lidar_segm', 'magic_left_rgb',
+                #  'magic_right_rgb', 'magic_top_rgb', 'magic_left_lidar_segm',
+                #  'magic_right_lidar_segm', 'magic_top_lidar_segm'].
+
+                # List of sensors != list of views, so use hard-coded correspondence.
+                view_sensor_matching = [0, 3, 4, 5]
+                view_names = ['forward', 'magic_left', 'magic_right', 'magic_top']
+                num_views = len(view_names)
+                sensor_RT = sensor_RT[:, view_sensor_matching]  # (T, V, 4, 4) = (2010, 4, 4, 4).
+                # sensor_types = ['rgb', 'lidar_segm', 'depth', 'segm']
+
+                (frame_start, num_frames, occl_frame_idx, found_occl_rate, proceed_sample_bias) = \
+                    self._get_frame_start(index, scene_dp, sensor_RT)
+                if frame_start is None:
+                    continue  # Failed due to ego not moving when requested.
+
+                frame_end = frame_start + self.video_length * self.frame_skip
+                frame_inds = np.arange(frame_start, frame_end, self.frame_skip)
+
+                all_rgb = []
+                all_RT = []
+                all_K = []
+                all_lidar = []
+                all_lidar_nss = []  # Not subsampled for accurate live_occl.
+                cuboid_filter_ratios = []
+                sample_input_ratios = []
+                sample_target_ratios = []
+
+                for v in range(num_views):
+                    view = view_names[v]
+                    view_rgb = []
+                    view_RT = []
+                    view_K = []
+                    view_lidar = []
+                    view_lidar_nss = []
+
+                    for f in frame_inds:
+                        rgb_fp = os.path.join(scene_content_dp, f'{f:05d}_{view}_rgb.png')
+                        # NOTE: Every view has semantic information for lidar as of mv_2.
+                        lidar_segm_fp = os.path.join(
+                            scene_content_dp, f'{f:05d}_{view}_lidar_segm.npy')
+
+                        rgb = plt.imread(rgb_fp)[..., :3].astype(np.float32)
+                        cam_RT = sensor_RT[f, v].astype(np.float32)  # (4, 4).
+                        cam_K = sensor_K.astype(np.float32)  # (3, 3).
+                        lidar = np.load(lidar_segm_fp).astype(np.float32)  # (N, 9).
+                        # (x, y, z, cosine_angle, instance_id, semantic_tag, R, G, B).
+
+                        # Transform to common reference frame (= present time, forward view).
+                        if self.reference_frame is not None:
+                            ref_frame_idx = frame_inds[self.reference_frame]
+                        else:
+                            ref_frame_idx = f
+                        ref_view_idx = 0
+                        if f != ref_frame_idx or v != ref_view_idx:
+                            source_matrix = cam_RT
+                            target_matrix = sensor_RT[ref_frame_idx, ref_view_idx]
+                            target_matrix = target_matrix.astype(np.float32)
+                            lidar = geometry.transform_lidar_frame(
+                                lidar, source_matrix, target_matrix)
+
+                        # Translate in Z to ensure the sensor origin equals the ground, such that
+                        # min_z indicates distance to street level. However, the street surface
+                        # level can also vary across the map, so we cannot rely on sensor_RT, and
+                        # instead we have to use the hard-coded sensor height of 1 meter during
+                        # dataset construction.
+                        if self.correct_origin_ground:
+                            ref_sensor_height = 1.0
+                            lidar[..., 2] += ref_sensor_height
+
+                        # Restrict to cuboid of interest.
+                        pre_filter_size = lidar.shape[0]
+                        lidar = geometry.filter_pcl_bounds_carla_input_numpy(
+                            lidar, min_z=self.min_z, other_bounds=self.other_bounds,
+                            cube_mode=self.cube_mode)
+                        post_filter_size = lidar.shape[0]
+                        cuboid_filter_ratios.append(post_filter_size / max(pre_filter_size, 1))
+
+                        # NOTE: This step has no effect if there are insufficient points.
+                        if keep_nss:
+                            lidar_nss = lidar
+                        else:
+                            lidar_nss = None
+                        if self.n_points_rnd > 0:
+                            lidar = geometry.subsample_pad_pcl_numpy(
+                                lidar, self.n_points_rnd, subsample_only=False)
+                        lidar = lidar.astype(np.float32)
+                        # NOTE: At this stage, we have only used primitive subsampling techniques,
+                        # and the point cloud is still generally oversized. Later, we use FPS and
+                        # match sizes taking into account how frames and/or views are aggregated.
+
+                        view_rgb.append(rgb)
+                        view_RT.append(cam_RT)
+                        view_K.append(cam_K)
+                        view_lidar.append(lidar)
+                        view_lidar_nss.append(lidar_nss)
+
+                    view_rgb = np.stack(view_rgb)  # (T, H, W, 3).
+                    view_RT = np.stack(view_RT)  # (T, 3, 4).
+                    view_K = np.stack(view_K)  # (T, 3, 3).
+                    # NOTE: We cannot stack view_lidar because of potentially different sizes.
+                    # view_lidar = List-T of (N, 9).
+
+                    all_rgb.append(view_rgb)
+                    all_RT.append(view_RT)
+                    all_K.append(view_K)
+                    all_lidar.append(view_lidar)
+                    all_lidar_nss.append(view_lidar_nss)
+
+                all_rgb = np.stack(all_rgb)  # (V, T, H, W, 3).
+                all_RT = np.stack(all_RT)  # (V, T, 3, 4).
+                all_K = np.stack(all_K)  # (V, T, 3, 3).
+                # all_lidar = List-V of List-T of (N, 9).
+
+                # Generate appropriate versions of the point cloud data.
+                (V, T) = (num_views, self.video_length)
+                all_pcl_sizes = np.array([[all_lidar[v][t].shape[0]
+                                           for t in range(T)] for v in range(V)])
+                # List-V of List-T of (N, 9) with
+                # (x, y, z, cosine_angle, instance_id, semantic_tag, R, G, B).
+                lidar_video_views = utils.accumulate_pcl_time_numpy(all_lidar)
+                # List-V of (T*N, 10) with
+                # (x, y, z, cosine_angle, instance_id, semantic_tag, R, G, B, t).
+                lidar_merged_frames = utils.merge_pcl_views_numpy(all_lidar, insert_view_idx=True)
+                # List-T of (V*N, 10) with
+                # (x, y, z, cosine_angle, instance_id, semantic_tag, view_idx, R, G, B).
+
+                # Limit input to the desired time range.
+                if self.pcl_input_frames < self.video_length:
+                    show_frame_size_sum = 0
+                    for t in range(self.pcl_input_frames):
+                        show_frame_size_sum += all_lidar[0][t].shape[0]
+                    pcl_input = lidar_video_views[0][:show_frame_size_sum]
+                else:
+                    pcl_input = lidar_video_views[0]
+                # (x, y, z, cosine_angle, instance_id, semantic_tag, R, G, B, t).
+
+                # Always shuffle point cloud data just before converting to tensor.
+                np.random.shuffle(pcl_input)
+                pcl_input = self.to_tensor(pcl_input).squeeze(0)  # (T*N, 10).
+
+                # Subsample random input video and merged target here for efficiency.
+                pre_sample_size = pcl_input.shape[0]
+                pcl_input = geometry.subsample_pad_pcl_torch(
+                    pcl_input, self.n_fps_input,
+                    sample_mode='farthest_point', subsample_only=False)
+                post_sample_size = pcl_input.shape[0]
+                sample_input_ratios.append(post_sample_size / max(pre_sample_size, 1))
+                pcl_input_size = min(pre_sample_size, post_sample_size)
+
+                # NOTE: The input may sometimes empty if we restrict point categories.
+                # We have to skip these cases because they are unreliable.
+                if pcl_input_size < self.min_input_size:
+                    self.logger.warning(f'Invalid due to pcl_input_size: {pcl_input_size}')
+                    continue
+
+                pcl_target = []  # List-T of (V*N, 10).
+                pcl_target_size = []
+                for t in range(self.pcl_target_frames):
+                    pcl_target_frame = lidar_merged_frames[-self.pcl_target_frames + t]
+                    np.random.shuffle(pcl_target_frame)
+                    pcl_target_frame = self.to_tensor(pcl_target_frame).squeeze(0)  # (V*N, 10).
+                    # (x, y, z, cosine_angle, instance_id, semantic_tag, view_idx, R, G, B).
+
+                    # It is best to filter the target by the output cube here already.
+                    # Retain 2 meters of context to allow for semantic guidance during supervision.
+                    padding = 2.0
+                    pcl_target_frame = geometry.filter_pcl_bounds_carla_output_torch(
+                        pcl_target_frame, min_z=self.min_z, other_bounds=self.target_bounds,
+                        padding=padding, cube_mode=self.cube_mode)
+
+                    pcl_target.append(pcl_target_frame)
+                    pcl_target_size.append(pcl_target_frame.shape[0])
+
+                # NOTE: The target is sometimes empty in CARLA.
+                # We have to skip these cases because they are unreliable.
+                if np.any(np.array(pcl_target_size) < self.min_target_size):
+                    self.logger.warning(f'Invalid due to pcl_target_size: {pcl_target_size}')
+                    continue
+
+            except Exception as e:
+                self.logger.warning(e)
+                continue
+
+            is_valid = True  # We can now be certain.
+
+        if self.n_fps_target != 0:
+            # NOTE: farthest_point is relatively expensive, while random is fast but less spatially
+            # balanced.
+            sample_mode = 'farthest_point' if self.n_fps_target > 0 else 'random'
+
+            for i in range(self.pcl_target_frames):
+                pre_sample_size = pcl_target[i].shape[0]
+                pcl_target[i] = geometry.subsample_pad_pcl_torch(
+                    pcl_target[i], abs(self.n_fps_target),
+                    sample_mode=sample_mode, subsample_only=False,
+                    retain_vehped=self.oversample_vehped_target, segm_idx=5)
+                post_sample_size = pcl_target[i].shape[0]
+                sample_target_ratios.append(post_sample_size / max(pre_sample_size, 1))
+                pcl_target_size[i] = min(pre_sample_size, post_sample_size)
+
+        else:
+            # Do not further subsample target point cloud.
+            assert pcl_target[0].shape[0] == pcl_target_size[0]
+
+        # Ensure cosine angle, instance id, and semantic tag are kept separate in input view.
+        pcl_input_sem = pcl_input[..., 3:-4]
+        # (N, 3) with (cosine_angle, instance_id, semantic_tag).
+        pcl_input = torch.cat([pcl_input[..., :3], pcl_input[..., -4:]], dim=-1)
+        # (N, 7) with (x, y, z, R, G, B, t).
+
+        # Get approximate per-instance occlusion percentage over time.
+        all_pcl_for_occl = (all_lidar_nss if keep_nss else all_lidar)
+        (live_occl, valo_ids_pad, num_valo_ids, vehped_mask) = data_utils.get_valo_ids(
+            self.live_occl_mode, scene_idx, scene_dp,
+            True, 1, 2, 4,
+            self.pcl_input_frames, self.video_length, frame_start, frame_end, self.frame_skip,
+            self.sb_occl_frame_shift, 0, num_views, _MAX_VALO_IDS, self.logger,
+            all_pcl_for_occl, pcl_input_sem, lidar_merged_frames)
+
+        # Append stub mark_track as extra (last) feature to input & target point clouds.
+        track_id = -1
+        pcl_input_track = torch.zeros_like(pcl_input[..., 0:1])
+        pcl_target_track = [torch.zeros_like(ptf[..., 0:1]) for ptf in pcl_target]
+        pcl_input = torch.cat([pcl_input, pcl_input_track], dim=-1)
+        # (N, 8) with (x, y, z, R, G, B, t, mark_track).
+        for i in range(self.pcl_target_frames):
+            pcl_target[i] = torch.cat([pcl_target[i], pcl_target_track[i]], dim=-1)
+            # (M, 11) with (x, y, z, cosine_angle, instance_id, semantic_tag, view_idx, R, G, B, mark_track).
+
+        # Metadata is all lightweight stuff (so no big arrays or tensors).
+        meta_data = dict()
+        meta_data['data_kind'] = 1002  # Cannot be string.
+        meta_data['num_views'] = num_views
+        meta_data['num_frames'] = num_frames  # Total in this scene video.
+        meta_data['scene_idx'] = scene_idx
+        # Clip subselection, e.g. [464, 467, 470, 473, 476, 479].
+        meta_data['frame_inds'] = frame_inds
+        meta_data['n_fps_input'] = self.n_fps_input
+        meta_data['n_fps_target'] = self.n_fps_target
+        meta_data['pcl_sizes'] = all_pcl_sizes  # Per view and per frame.
+        meta_data['pcl_input_size'] = pcl_input_size
+        meta_data['pcl_target_size'] = pcl_target_size
+        meta_data['view_sensor_matching'] = view_sensor_matching
+        meta_data['cuboid_filter_ratios'] = cuboid_filter_ratios
+        meta_data['sample_input_ratios'] = sample_input_ratios
+        meta_data['sample_target_ratios'] = sample_target_ratios
+        meta_data['occl_frame_idx'] = occl_frame_idx
+        meta_data['found_occl_rate'] = found_occl_rate
+        meta_data['proceed_sample_bias'] = proceed_sample_bias
+        meta_data['valo_ids'] = valo_ids_pad
+        meta_data['num_valo_ids'] = num_valo_ids
+        meta_data['live_occl'] = live_occl
+        meta_data['track_id'] = track_id
+
+        # Make all information easily accessible.
+        to_return = dict()
+        to_return['rgb'] = all_rgb
+        to_return['cam_RT'] = all_RT
+        to_return['cam_K'] = all_K
+        to_return['pcl_input'] = pcl_input
+        # (N, 8) with (x, y, z, R, G, B, t, mark_track).
+        to_return['pcl_input_sem'] = pcl_input_sem
+        # (N, 3) with (cosine_angle, instance_id, semantic_tag).
+        to_return['pcl_target'] = pcl_target
+        # List of (M, 11) with (x, y, z, cosine_angle, instance_id, semantic_tag, view_idx, R, G, B, mark_track).
+        to_return['meta_data'] = meta_data
+
+        if self.verbose and initial_index < 32:
+            self.logger.info(f'scene_idx: {scene_idx}  frame_inds: {frame_inds}')
+            if 'occl' in self.sample_bias and proceed_sample_bias:
+                self.logger.info(f'occl_frame_idx: {occl_frame_idx}  '
+                                 f'found_occl_rate: {found_occl_rate:.3f}')
+
+        return to_return
+
+
+def merge_intensity_semantic_lidar(lidar, lidar_segm):
+    '''
+    :param lidar (N, 7) numpy array with (x, y, z, intensity, R, G, B).
+    :param lidar_segm (N, 9) numpy array with
+        (x, y, z, cosine_angle, instance_id, semantic_tag, R, G, B).
+    :return lidar_merge (N, 10) numpy array with
+        (x, y, z, intensity, cosine_angle, instance_id, semantic_tag, R, G, B).
+    '''
+    assert lidar.shape[0] == lidar_segm.shape[0]
+    np.testing.assert_array_almost_equal(lidar[0, :3], lidar_segm[0, :3])
+    np.testing.assert_array_almost_equal(lidar[-1, :3], lidar_segm[-1, :3])
+    result_xyzi = lidar[..., :4]
+    result_sem = lidar_segm[..., 3:-3]
+    result_rgb = lidar[..., -3:]
+    result = np.concatenate([result_xyzi, result_sem, result_rgb], axis=-1)
+    return result

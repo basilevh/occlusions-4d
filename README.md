@@ -47,7 +47,7 @@ We use the wandb library for logging, but additional logs are also stored in `lo
 
 ## Pretrained Models
 
-Coming soon!
+See `pretrained/`.
 
 ## BibTeX Citation
 
