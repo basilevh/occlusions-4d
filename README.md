@@ -12,7 +12,7 @@ CVPR 2022 (Oral)
   <img width="100%" src="Teaser.png">
 </p>
 <p align="center">
-  <img width="70%" src="KeyIdea.png">
+  <img width="60%" src="KeyIdea.png">
 </p>
 
 This repository is aimed at publishing the PyTorch implementation underlying our attention-based continuous representation framework for dynamic scene completion.
