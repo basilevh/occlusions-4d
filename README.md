@@ -33,7 +33,7 @@ The commands that we used to train our models are listed below.
 
 For GREATER:
 ```
-CUDA_VISIBLE_DEVICES=0,1,2 python train.py --name gv1 --num_workers 52 --data_path /path/to/greater/ --batch_size 3 --up_down_blocks 3 --transition_factor 3 --pt_feat_dim 36 --pt_num_neighbors 14 --pt_norm_type none --down_neighbors 12 --n_points 14336 --n_data_rnd 14336 --video_len 12 --frame_skip 2 --pt_cube_bounds 5 --cr_cube_bounds 5 --implicit_mlp_blocks 6 --local_implicit_mode attention --cross_attn_layers 2 --cross_attn_neighbors 14 --abstract_levels 1 --color_mode rgb_nosigmoid --num_epochs 20 --density_lw 1.0 --color_lw 1.0 --segmentation_lw 0.0 --tracking_lw 1.0 --point_occupancy_radius 0.2 --air_sampling_ratio 1.5 --point_sample_bias none --past_frames 4 --future_frames 0
+CUDA_VISIBLE_DEVICES=0,1,2 python train.py --name gv1 --num_workers 52 --data_path /path/to/greater/ --batch_size 3 --up_down_blocks 3 --transition_factor 3 --pt_feat_dim 36 --pt_num_neighbors 16 --pt_norm_type none --down_neighbors 12 --n_points 14336 --n_data_rnd 14336 --video_len 12 --frame_skip 2 --pt_cube_bounds 5 --cr_cube_bounds 5 --implicit_mlp_blocks 6 --local_implicit_mode attention --cross_attn_layers 2 --cross_attn_neighbors 14 --abstract_levels 1 --color_mode rgb_nosigmoid --num_epochs 20 --density_lw 1.0 --color_lw 1.0 --segmentation_lw 0.0 --tracking_lw 1.0 --point_occupancy_radius 0.2 --air_sampling_ratio 1.5 --point_sample_bias none --past_frames 4 --future_frames 0
 ```
 
 For CARLA:

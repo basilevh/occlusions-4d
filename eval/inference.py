@@ -55,17 +55,6 @@ def load_models(checkpoint_path, device, epoch=-1, logger=None):
     print_fn('Point transformer model args: ' + str(pcl_args))
     print_fn('Continuous model args: ' + str(implicit_args))
 
-    # Fix deprecations.
-    if 'pt_batch_norm' in pcl_args:
-        pcl_args['pt_norm_type'] = 'batch' if pcl_args['pt_batch_norm'] else 'none'
-        del pcl_args['pt_batch_norm']
-    if 'pt_num_neighbors' in implicit_args:
-        implicit_args['cross_attn_neighbors'] = implicit_args['pt_num_neighbors']
-        del implicit_args['pt_num_neighbors']
-    if 'cross_attention_layers' in implicit_args:
-        implicit_args['cross_attn_layers'] = implicit_args['cross_attention_layers']
-        del implicit_args['cross_attention_layers']
-
     # Make test-time model deterministic.
     pcl_args['fps_random_start'] = False
 
