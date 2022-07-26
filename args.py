@@ -356,7 +356,7 @@ def test_args():
                         '(point_sample_mode must be grid).')
     parser.add_argument('--use_json', default=False, type=str2bool,
                         help='Use predetermined test clips (frame start + source view).')
-    parser.add_argument('--live_occl_mode', default='live', type=str,
+    parser.add_argument('--live_occl_mode', default='normal', type=str,
                         help='Which points to use for estimating occlusion rates and visible at '
                         'least once objects (normal / unfilt).')
 
