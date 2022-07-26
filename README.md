@@ -45,9 +45,14 @@ The `--data_path` argument should point to a directory that contains the `train`
 
 We use the wandb library for logging, but additional logs are also stored in `logs/`, while checkpointing is done in `checkpoints/`.
 
+Next, here is an example test command that will generate and store point clouds as pickle files within `logs/`:
+```
+python eval/test.py --resume v1 --name v1-t1 --data_path /path/to/greater_or_carla/ --num_workers 8 --gpu_id 0 --sample_bias occl --sb_occl_frame_shift 2 --num_sample 524288 --implicit_batch_size 32768 --point_sample_mode grid --use_data_frac 1.0 --density_threshold 0.5 --store_pcl 1
+```
+
 ## Pretrained Models
 
-See `pretrained/`.
+See `pretrained/`. It is recommended to run and subsequently halt the above training commands such that the correct folders are generated automatically. Then rename the desired pretrained checkpoint file to `checkpoint.pth` and place it in appropriate subfolder `checkpoints/cv1_.../checkpoint.pth`. Then, you can either use `train.py` or `test.py` command with `--resume cv1` to load that checkpoint.
 
 ## BibTeX Citation
 
