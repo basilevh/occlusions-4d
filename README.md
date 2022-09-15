@@ -54,6 +54,8 @@ python eval/test.py --resume v1 --name v1-t1 --data_path /path/to/greater_or_car
 
 See `pretrained/`. It is recommended to run and subsequently halt the above training commands such that the correct folders are generated automatically. Then rename the desired pretrained checkpoint file to `checkpoint.pth` and place it in appropriate subfolder `checkpoints/cv1_.../checkpoint.pth`. Then, you can either use `train.py` or `test.py` command with `--resume cv1` to load that checkpoint.
 
+If you are interested in adapting our architecture for your own research instead of training or using this particular framework, check out the `model/` folder.
+
 ## BibTeX Citation
 
 ```
