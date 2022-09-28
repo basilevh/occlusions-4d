@@ -43,6 +43,8 @@ CUDA_VISIBLE_DEVICES=0,1,2 python train.py --name cv1 --num_workers 52 --data_pa
 
 The `--data_path` argument should point to a directory that contains the `train` and `val` folders, which should themselves contain each scene as a separate folder. The exact format differs between GREATER and CARLA, but the code will select the correct data loader from `data/` accordingly.
 
+Note that these commands will require roughly 48 GB of VRAM because of point attention, but this requirement can be softened by decreasing `n_points`.
+
 We use the wandb library for logging, but additional logs are also stored in `logs/`, while checkpointing is done in `checkpoints/`.
 
 Next, here is an example test command that will generate and store point clouds as pickle files within `logs/`:
