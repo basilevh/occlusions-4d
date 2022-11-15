@@ -220,7 +220,7 @@ class MyTrainPipeline(torch.nn.Module):
         '''
         Finalizes the training step. Calculates all losses.
         '''
-        (loss_rgb, loss_dens, loss_segm, loss_track) = remnant[:6]
+        (loss_rgb, loss_dens, loss_segm, loss_track) = remnant[:4]
         (points_query, implicit_output, features_global) = remnant[-3:]
         log_info = remnant[6:]
 
