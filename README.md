@@ -6,7 +6,7 @@ Columbia University and Toyota Research Institute
 
 CVPR 2022 (Oral)
 
-[Paper](https://arxiv.org/pdf/2204.10916.pdf) | [Website](https://occlusions.cs.columbia.edu/) | [Data](https://github.com/basilevh/carla-greater)
+[Paper](https://arxiv.org/pdf/2204.10916.pdf) | [Website](https://occlusions.cs.columbia.edu/) | [Datasets](https://github.com/basilevh/carla-greater)
 
 <p align="center">
   <img width="100%" src="Teaser.png">
