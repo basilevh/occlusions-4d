@@ -19,7 +19,7 @@ This repository is aimed at publishing the PyTorch implementation underlying our
 
 ## Datasets
 
-We contribute two large-scale 3D video datasets, GREATER and CARLA, which are described and visualized on our [website](https://occlusions.cs.columbia.edu/).
+We contribute two large-scale 3D video datasets, GREATER and CARLA-4D, which are described and visualized on our [website](https://occlusions.cs.columbia.edu/).
 
 [Click here](https://forms.gle/AqJ1kcwEJNJkvqpdA) to access the already generated data that we actually used to train and evaluate our models. This step is necessary to succesfully run the commands below.
 
@@ -36,12 +36,12 @@ For GREATER:
 CUDA_VISIBLE_DEVICES=0,1,2 python train.py --name gv1 --num_workers 52 --data_path /path/to/greater/ --batch_size 3 --up_down_blocks 3 --transition_factor 3 --pt_feat_dim 36 --pt_num_neighbors 16 --pt_norm_type none --down_neighbors 12 --n_points 14336 --n_data_rnd 14336 --video_len 12 --frame_skip 2 --pt_cube_bounds 5 --cr_cube_bounds 5 --implicit_mlp_blocks 6 --local_implicit_mode attention --cross_attn_layers 2 --cross_attn_neighbors 14 --abstract_levels 1 --color_mode rgb_nosigmoid --num_epochs 20 --density_lw 1.0 --color_lw 1.0 --segmentation_lw 0.0 --tracking_lw 1.0 --point_occupancy_radius 0.2 --air_sampling_ratio 1.5 --point_sample_bias none --past_frames 4 --future_frames 0
 ```
 
-For CARLA:
+For CARLA-4D:
 ```
 CUDA_VISIBLE_DEVICES=0,1,2 python train.py --name cv1 --num_workers 52 --data_path /path/to/carla/ --batch_size 3 --up_down_blocks 3 --transition_factor 3 --pt_feat_dim 36 --pt_num_neighbors 16 --pt_norm_type layer --down_neighbors 12 --n_points 14336 --n_data_rnd 14336 --video_len 12 --frame_skip 3 --pt_cube_bounds 20 --cr_cube_bounds 16 --cube_mode 4 --implicit_mlp_blocks 6 --local_implicit_mode attention --cross_attn_layers 2 --cross_attn_neighbors 14 --abstract_levels 2 --semantic_classes 13 --num_epochs 40 --density_lw 1.0 --color_lw 0.0 --segmentation_lw 0.6 --tracking_lw 0.0 --point_occupancy_radius 0.2 --air_sampling_ratio 1.4 --point_sample_bias low_moving_ivalo_sembal --sample_bias occl --oversample_vehped_target 1 --past_frames 4 --future_frames 0
 ```
 
-The `--data_path` argument should point to a directory that contains the `train` and `val` folders, which should themselves contain each scene as a separate folder. The exact format differs between GREATER and CARLA, but the code will select the correct data loader from `data/` accordingly.
+The `--data_path` argument should point to a directory that contains the `train` and `val` folders, which should themselves contain each scene as a separate folder. The exact format differs between GREATER and CARLA-4D, but the code will select the correct data loader from `data/` accordingly.
 
 Note that these commands will require roughly 48 GB of VRAM because of point attention, but this requirement can be softened by decreasing `n_points`.
 
